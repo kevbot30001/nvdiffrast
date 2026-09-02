@@ -5,10 +5,10 @@
 # and any modifications thereto.  Any use, reproduction, disclosure or
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
+# ruff: noqa: I001
 
 import numpy as np
 import torch
-import warnings
 import _nvdiffrast_c
 
 #----------------------------------------------------------------------------
@@ -133,6 +133,89 @@ def rasterize(glctx, pos, tri, resolution, ranges=None, grad_db=True):
 
     # Instantiate the function.
     return _rasterize_func.apply(glctx, pos, tri, resolution, ranges, grad_db, -1)
+
+
+def rasterize_lines(cuda_ctx, pos, lines, resolution):
+    '''Rasterize one-pixel-wide line segments using the CUDA triangle rasterizer.
+
+    This helper is intended for visibility sampling, such as discovering the
+    pixels crossed by DiffCSG Boolean intersection edges. It expands each line
+    to a one-pixel-wide screen-space quad, rasterizes the quads as triangles,
+    and maps the resulting triangle IDs back to one-based line IDs. The output
+    is detached because line coverage is discrete; differentiable endpoints
+    should be supplied separately to ``antialias()``.
+
+    Args:
+        cuda_ctx: Rasterizer context of type ``RasterizeCudaContext``.
+        pos: Homogeneous clip-space positions shaped ``[1, V, 4]``.
+        lines: Line indices shaped ``[N, 2]`` with dtype ``torch.int32``.
+        resolution: Output resolution as ``(height, width)``.
+
+    Returns:
+        A detached raster tensor shaped ``[1, height, width, 4]`` whose fourth
+        channel contains one-based line IDs.
+    '''
+    assert isinstance(cuda_ctx, RasterizeCudaContext)
+    assert isinstance(pos, torch.Tensor) and isinstance(lines, torch.Tensor)
+    assert pos.ndim == 3 and pos.shape[0] == 1 and pos.shape[2] == 4
+    assert lines.ndim == 2 and lines.shape[1] == 2 and lines.dtype == torch.int32
+    assert pos.is_cuda and lines.is_cuda
+
+    height, width = tuple(resolution)
+    assert height > 0 and width > 0
+    if lines.shape[0] == 0:
+        return pos.new_zeros((1, height, width, 4))
+
+    # Coverage is intentionally non-differentiable. Keep the original line
+    # endpoints for the subsequent antialias() call instead.
+    endpoints = pos.detach()[0, lines.long()]
+    w = endpoints[..., 3:4]
+    safe_w = torch.where(w.abs() < 1e-8, torch.where(w < 0, -1.0, 1.0) * 1e-8, w)
+    ndc = endpoints[..., :3] / safe_w
+
+    # Compute a half-pixel normal in framebuffer coordinates and convert it to
+    # NDC. This produces the same kind of one-pixel coverage mask as GL_LINES
+    # while using only the existing CUDA triangle rasterizer.
+    delta_pixels = torch.stack(
+        (
+            (ndc[:, 1, 0] - ndc[:, 0, 0]) * (width * 0.5),
+            (ndc[:, 1, 1] - ndc[:, 0, 1]) * (height * 0.5),
+        ),
+        dim=-1,
+    )
+    length = torch.linalg.vector_norm(delta_pixels, dim=-1, keepdim=True).clamp_min(1e-8)
+    normal_pixels = torch.cat((-delta_pixels[:, 1:], delta_pixels[:, :1]), dim=-1) / length
+    offset_ndc = torch.stack(
+        (normal_pixels[:, 0] / width, normal_pixels[:, 1] / height), dim=-1
+    )
+
+    offset_clip = torch.zeros_like(endpoints[:, 0])
+    offset_clip[:, :2] = offset_ndc * safe_w[:, 0]
+    start_plus = endpoints[:, 0] + offset_clip
+    start_minus = endpoints[:, 0] - offset_clip
+    offset_clip[:, :2] = offset_ndc * safe_w[:, 1]
+    end_plus = endpoints[:, 1] + offset_clip
+    end_minus = endpoints[:, 1] - offset_clip
+    quad_pos = torch.stack((start_plus, start_minus, end_plus, end_minus), dim=1)
+    quad_pos = quad_pos.reshape(1, -1, 4).contiguous()
+
+    base = torch.arange(lines.shape[0], dtype=torch.int32, device=lines.device) * 4
+    quad_tri = torch.stack(
+        (
+            torch.stack((base, base + 1, base + 2), dim=-1),
+            torch.stack((base + 2, base + 1, base + 3), dim=-1),
+        ),
+        dim=1,
+    ).reshape(-1, 3).contiguous()
+    quad_rast, _ = rasterize(cuda_ctx, quad_pos, quad_tri, (height, width), grad_db=False)
+
+    triangle_id = quad_rast[..., 3]
+    line_id = torch.where(
+        triangle_id > 0,
+        torch.div(triangle_id - 1, 2, rounding_mode='floor') + 1,
+        0,
+    )
+    return torch.cat((quad_rast[..., :3], line_id.unsqueeze(-1)), dim=-1).detach()
 
 #----------------------------------------------------------------------------
 # Depth peeler context manager for rasterizing multiple depth layers.
@@ -542,20 +625,5 @@ def antialias_construct_topology_hash(tri):
     """
     assert isinstance(tri, torch.Tensor)
     return _nvdiffrast_c.antialias_construct_topology_hash(tri)
-
-#----------------------------------------------------------------------------
-# Legacy OpenGL context stub for backwards compatibility.
-#----------------------------------------------------------------------------
-
-class RasterizeGLContext(RasterizeCudaContext):
-    def __init__(self, output_db=True, mode='automatic', device=None):
-        warnings.warn("RasterizeGLContext has been deprecated and uses RasterizeCudaContext internally", DeprecationWarning, stacklevel=2)
-        super().__init__(device=device)
-
-    def set_context(self):
-        pass
-
-    def release_context(self):
-        pass
 
 #----------------------------------------------------------------------------

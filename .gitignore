@@ -1,0 +1,17 @@
+# Python caches and environments.
+__pycache__/
+*.py[cod]
+.venv/
+
+# Python/CUDA package build products.
+build/
+dist/
+*.egg-info/
+*.so
+
+# Test and lint caches.
+.pytest_cache/
+.ruff_cache/
+
+# Local nvdiffrast extension cache.
+tmp/
