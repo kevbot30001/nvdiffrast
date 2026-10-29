@@ -147,28 +147,30 @@ def rasterize_lines(cuda_ctx, pos, lines, resolution):
 
     Args:
         cuda_ctx: Rasterizer context of type ``RasterizeCudaContext``.
-        pos: Homogeneous clip-space positions shaped ``[1, V, 4]``.
+        pos: Homogeneous clip-space positions shaped ``[B, V, 4]``; ``B`` is the
+             camera/minibatch axis and every view shares the same line list.
         lines: Line indices shaped ``[N, 2]`` with dtype ``torch.int32``.
         resolution: Output resolution as ``(height, width)``.
 
     Returns:
-        A detached raster tensor shaped ``[1, height, width, 4]`` whose fourth
+        A detached raster tensor shaped ``[B, height, width, 4]`` whose fourth
         channel contains one-based line IDs.
     '''
     assert isinstance(cuda_ctx, RasterizeCudaContext)
     assert isinstance(pos, torch.Tensor) and isinstance(lines, torch.Tensor)
-    assert pos.ndim == 3 and pos.shape[0] == 1 and pos.shape[2] == 4
+    assert pos.ndim == 3 and pos.shape[2] == 4
     assert lines.ndim == 2 and lines.shape[1] == 2 and lines.dtype == torch.int32
     assert pos.is_cuda and lines.is_cuda
 
     height, width = tuple(resolution)
     assert height > 0 and width > 0
+    steps = pos.shape[0]
     if lines.shape[0] == 0:
-        return pos.new_zeros((1, height, width, 4))
+        return pos.new_zeros((steps, height, width, 4))
 
     # Coverage is intentionally non-differentiable. Keep the original line
     # endpoints for the subsequent antialias() call instead.
-    endpoints = pos.detach()[0, lines.long()]
+    endpoints = pos.detach()[:, lines.long()]
     w = endpoints[..., 3:4]
     safe_w = torch.where(w.abs() < 1e-8, torch.where(w < 0, -1.0, 1.0) * 1e-8, w)
     ndc = endpoints[..., :3] / safe_w
@@ -178,26 +180,26 @@ def rasterize_lines(cuda_ctx, pos, lines, resolution):
     # while using only the existing CUDA triangle rasterizer.
     delta_pixels = torch.stack(
         (
-            (ndc[:, 1, 0] - ndc[:, 0, 0]) * (width * 0.5),
-            (ndc[:, 1, 1] - ndc[:, 0, 1]) * (height * 0.5),
+            (ndc[..., 1, 0] - ndc[..., 0, 0]) * (width * 0.5),
+            (ndc[..., 1, 1] - ndc[..., 0, 1]) * (height * 0.5),
         ),
         dim=-1,
     )
     length = torch.linalg.vector_norm(delta_pixels, dim=-1, keepdim=True).clamp_min(1e-8)
-    normal_pixels = torch.cat((-delta_pixels[:, 1:], delta_pixels[:, :1]), dim=-1) / length
+    normal_pixels = torch.cat((-delta_pixels[..., 1:], delta_pixels[..., :1]), dim=-1) / length
     offset_ndc = torch.stack(
-        (normal_pixels[:, 0] / width, normal_pixels[:, 1] / height), dim=-1
+        (normal_pixels[..., 0] / width, normal_pixels[..., 1] / height), dim=-1
     )
 
-    offset_clip = torch.zeros_like(endpoints[:, 0])
-    offset_clip[:, :2] = offset_ndc * safe_w[:, 0]
-    start_plus = endpoints[:, 0] + offset_clip
-    start_minus = endpoints[:, 0] - offset_clip
-    offset_clip[:, :2] = offset_ndc * safe_w[:, 1]
-    end_plus = endpoints[:, 1] + offset_clip
-    end_minus = endpoints[:, 1] - offset_clip
-    quad_pos = torch.stack((start_plus, start_minus, end_plus, end_minus), dim=1)
-    quad_pos = quad_pos.reshape(1, -1, 4).contiguous()
+    offset_clip = torch.zeros_like(endpoints[..., 0, :])
+    offset_clip[..., :2] = offset_ndc * safe_w[..., 0, :]
+    start_plus = endpoints[..., 0, :] + offset_clip
+    start_minus = endpoints[..., 0, :] - offset_clip
+    offset_clip[..., :2] = offset_ndc * safe_w[..., 1, :]
+    end_plus = endpoints[..., 1, :] + offset_clip
+    end_minus = endpoints[..., 1, :] - offset_clip
+    quad_pos = torch.stack((start_plus, start_minus, end_plus, end_minus), dim=2)
+    quad_pos = quad_pos.reshape(steps, -1, 4).contiguous()
 
     base = torch.arange(lines.shape[0], dtype=torch.int32, device=lines.device) * 4
     quad_tri = torch.stack(
